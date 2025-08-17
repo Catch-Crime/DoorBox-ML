@@ -1,0 +1,263 @@
+import os
+import numpy as np
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_recall_fscore_support,
+    roc_auc_score,
+    confusion_matrix,
+    classification_report,
+)
+
+import torchvision.transforms.functional as TF
+from torchvision.transforms import InterpolationMode
+from torchvision import models
+from torchvision.models import EfficientNet_B0_Weights
+
+from preprocess import get_data_loaders
+
+# AMP import (PyTorch 2.x 권장 → 구버전 폴백)
+try:
+    from torch.amp import autocast, GradScaler   # PyTorch 2.x
+    AMP_NS = "torch.amp"
+except Exception:
+    from torch.cuda.amp import autocast, GradScaler
+    AMP_NS = "torch.cuda.amp"
+
+# 전역 최적화 플래그
+cudnn.benchmark = True  # 고정 해상도면 커널 선택 최적화
+try:
+    torch.set_float32_matmul_precision("high")   # Ampere/ADA에서 matmul 최적화
+except Exception:
+    pass
+
+# 경로 설정
+base_dir = "/workspace/datasets"
+train_dir = os.path.join(base_dir, "train")
+test_dir  = os.path.join(base_dir, "test")
+
+# 하이퍼파라미터
+num_classes   = 2
+num_epochs    = 100
+batch_size    = 16
+learning_rate = 0.00001
+
+# TTA / 평가 옵션
+USE_TTA          = True
+ANGLES           = (-20, -10, 0, 10, 20)
+NEG_CLASS_INDEX  = 0
+NEG_THRESHOLD    = 0.48
+INTERP           = InterpolationMode.BILINEAR
+FILL_VALUE       = 0
+THR_GRID         = np.linspace(0.30, 0.70, 9)
+EVAL_EVERY_EPOCH = 1
+
+# 디바이스
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+amp_enabled = (device.type == "cuda")
+print(f"현재 디바이스: {device} | AMP: {AMP_NS} (enabled={amp_enabled})")
+
+# 데이터
+# get_data_loaders 내부에서 가능하면:
+#   num_workers=4~8, pin_memory=True, persistent_workers=True, prefetch_factor=2
+train_loader, test_loader = get_data_loaders(
+    train_dir, test_dir, image_size=(320, 320), batch_size=batch_size
+)
+
+# 모델
+weights = EfficientNet_B0_Weights.DEFAULT
+model = models.efficientnet_b0(weights=weights)
+in_features = model.classifier[1].in_features
+model.classifier[1] = nn.Linear(in_features, num_classes)
+model = model.to(device)
+# 메모리 레이아웃 최적화 (결과 동일, 속도 개선 가능)
+model.to(memory_format=torch.channels_last)
+
+# 손실/옵티마이저/스케일러
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+scaler = GradScaler(enabled=amp_enabled)
+
+def sweep_thresholds(y_true, p_neg, thresholds):
+    """
+    y_true: [N] (0=negative, 1=non-negative)
+    p_neg : [N] (negative 확률)
+    """
+    y_true = np.asarray(y_true)
+    p_neg  = np.asarray(p_neg)
+
+    rows = []
+    best_by_acc   = (None, -1.0)
+    best_by_f1neg = (None, -1.0)
+
+    try:
+        auc_neg = roc_auc_score(y_true == 0, p_neg)
+    except Exception:
+        auc_neg = None
+
+    for thr in thresholds:
+        y_pred = (p_neg >= thr).astype(np.int64)
+        acc = accuracy_score(y_true, y_pred)
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, labels=[0, 1], average=None, zero_division=0
+        )
+        prec_neg, rec_neg, f1_neg = prec[0], rec[0], f1[0]
+        rows.append((thr, acc, prec_neg, rec_neg, f1_neg))
+        if acc > best_by_acc[1]:
+            best_by_acc = (thr, acc)
+        if f1_neg > best_by_f1neg[1]:
+            best_by_f1neg = (thr, f1_neg)
+
+    print("\n[Threshold sweep on negative probability]")
+    if auc_neg is not None:
+        print(f"AUC (neg as positive): {auc_neg:.4f}")
+    print(" thr   |  acc    |  neg-prec  neg-rec   neg-f1")
+    print("-----------------------------------------------")
+    for thr, acc, p0, r0, f10 in rows:
+        print(f" {thr:0.2f} | {acc:0.4f} |  {p0:0.4f}   {r0:0.4f}   {f10:0.4f}")
+    print("\nBest by ACC     : thr={:.2f}, acc={:.4f}".format(*best_by_acc))
+    print("Best by F1(neg) : thr={:.2f}, f1_neg={:.4f}".format(*best_by_f1neg))
+
+    return {
+        "table": rows,
+        "best_by_acc": best_by_acc,
+        "best_by_f1neg": best_by_f1neg,
+        "auc_neg": auc_neg,
+    }
+
+# 학습 루프
+best_acc = 0.0
+all_preds = []
+all_labels = []
+
+for epoch in range(num_epochs):
+    print(f"\n[Epoch {epoch+1}/{num_epochs}]")
+
+    # Train
+    model.train()
+    total_train_loss = 0.0
+    correct, total = 0, 0
+
+    for images, labels in tqdm(train_loader, desc="Training", leave=False):
+        images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device_type="cuda", enabled=amp_enabled):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_train_loss += loss.item()
+        _, predicted = torch.max(outputs, dim=1)
+        correct += (predicted == labels).sum().item()
+        total += labels.size(0)
+
+    train_acc = (correct / total) if total > 0 else 0.0
+    print(f"Train Loss: {total_train_loss:.4f}, Train Acc: {train_acc:.4f}")
+
+    # Eval (에폭마다 NO-TTA + 필요시 TTA, 원본과 동일한 흐름)
+    model.eval()
+    total_test_loss = 0.0
+    correct, total = 0, 0
+    all_preds = []
+    all_labels = []
+
+    probs_neg_tta = []
+    labels_tta    = []
+    probs_neg_no  = []
+    labels_no     = []
+
+    with torch.no_grad(), autocast(device_type="cuda", enabled=amp_enabled):
+        for images, labels in tqdm(test_loader, desc="Testing", leave=False):
+            images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            labels = labels.to(device, non_blocking=True)
+
+            # NO-TTA 손실/argmax
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            total_test_loss += loss.item()
+
+            _, predicted_argmax = torch.max(outputs, dim=1)
+            correct += (predicted_argmax == labels).sum().item()
+            total += labels.size(0)
+
+            all_preds.extend(predicted_argmax.detach().cpu().numpy())
+            all_labels.extend(labels.detach().cpu().numpy())
+
+            # NO-TTA 확률 (neg)
+            prob_no = F.softmax(outputs, dim=1)[:, NEG_CLASS_INDEX]
+            probs_neg_no.extend(prob_no.detach().cpu().numpy())
+            labels_no.extend(labels.detach().cpu().numpy())
+
+            # TTA 확률(최대 결합) — 원본은 각도별 순차, 여기서는 벡터화(동일 결과, 더 빠름)
+            if USE_TTA:
+                rotated = [TF.rotate(images, a, interpolation=INTERP, fill=FILL_VALUE) for a in ANGLES]
+                aug = torch.stack(rotated, dim=0)              # [A, B, C, H, W]
+                A, B = aug.shape[0], aug.shape[1]
+                aug = aug.view(A * B, *aug.shape[2:])          # [A*B, C, H, W]
+
+                logits = model(aug)                             # [A*B, num_classes]
+                probs  = F.softmax(logits, dim=1)[:, NEG_CLASS_INDEX]
+                probs  = probs.view(A, B)                       # [A, B]
+                probs_max = probs.max(dim=0).values             # 각 이미지 각도 중 최대
+                probs_neg_tta.extend(probs_max.detach().cpu().numpy())
+                labels_tta.extend(labels.detach().cpu().numpy())
+
+    test_acc = (correct / total) if total > 0 else 0.0
+    print(f"Test Loss: {total_test_loss:.4f}, Test Acc (argmax, no TTA): {test_acc:.4f}")
+
+    # 임계값 스윕
+    if (epoch + 1) % EVAL_EVERY_EPOCH == 0:
+        print("\n[NO-TTA threshold sweep]")
+        res_no = sweep_thresholds(labels_no, probs_neg_no, THR_GRID)
+
+        if USE_TTA:
+            print("\n[TTA threshold sweep]")
+            res_tta = sweep_thresholds(labels_tta, probs_neg_tta, THR_GRID)
+            print(f"\n[Suggest] NO-TTA thr (F1 neg): {res_no['best_by_f1neg'][0]:.2f}")
+            print(f"[Suggest]  TTA  thr (F1 neg): {res_tta['best_by_f1neg'][0]:.2f}")
+        else:
+            print(f"\n[Suggest] NO-TTA thr (F1 neg): {res_no['best_by_f1neg'][0]:.2f}")
+
+    # 모델 저장 argmax(no-TTA) 기준임
+    if test_acc > best_acc:
+        best_acc = test_acc
+        torch.save(model.state_dict(), "batch16_best.pth")
+        print("Best model saved.")
+
+# 최종 리포트 // 마지막 에폭 기준
+print("\nTraining complete.")
+print(f"Best Test Accuracy (argmax, no TTA): {best_acc:.4f}")
+print("\n[Confusion Matrix]")
+print(confusion_matrix(all_labels, all_preds))
+print("\n[Classification Report]")
+print(classification_report(all_labels, all_preds, target_names=['alert', 'non-alert']))
+
+# AUC / ROC 출력
+try:
+    # all_labels: 정답 (0=alert, 1=non-alert)
+    # all_preds : argmax 예측 결과 (0/1)
+    # AUC는 확률 기반이라, NO-TTA 확률을 저장해둔 probs_neg_no로 계산하는 게 일반적
+    y_true = np.array(all_labels)
+    y_score = np.array(probs_neg_no)  # 마지막 에폭에서 수집한 neg 확률
+
+    auc = roc_auc_score(y_true == 0, y_score)  # "neg를 양성"으로 보는 시각
+    fpr, tpr, thresholds = roc_curve(y_true == 0, y_score)
+
+    print(f"\n[ROC AUC] (neg as positive): {auc:.4f}")
+    print("FPR:", fpr)
+    print("TPR:", tpr)
+    print("Thresholds:", thresholds)
+except Exception as e:
+    print("\nROC AUC 계산 중 오류:", e)
