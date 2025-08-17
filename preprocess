@@ -1,0 +1,156 @@
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import transforms, datasets
+from torchvision.transforms import InterpolationMode
+import torchvision.transforms.functional as TF
+from face_rotation import AlignAndCropFace
+from PIL import Image
+
+def letterbox_320(img: Image.Image, fill=0, interp=InterpolationMode.BICUBIC):
+    """
+    비율을 유지해 가장 큰 변을 320에 맞춘 후, 여백을 패딩으로 채워
+    최종 320x320을 만드는 레터박스 변환.
+    - 업스케일 아티팩트 최소화 (148→320 직접 늘림보다 안전)
+    - 축소/확대 모두 BICUBIC 사용, antialias=True
+    """
+    if not isinstance(img, Image.Image):
+        return img
+    w, h = img.size
+    if w == 0 or h == 0:
+        return img
+
+    scale = min(320 / w, 320 / h)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+
+    img = TF.resize(img, (new_h, new_w), interpolation=interp, antialias=True)
+
+    pad_w = 320 - new_w
+    pad_h = 320 - new_h
+    pad_left = pad_w // 2
+    pad_top  = pad_h // 2
+    pad_right  = pad_w - pad_left
+    pad_bottom = pad_h - pad_top
+
+    # fill은 회색/검정 등 선택할 수 잇음 여기선 0(검정)으로 통일
+    img = TF.pad(img, [pad_left, pad_top, pad_right, pad_bottom], fill=fill)
+    return img
+
+
+def _build_train_transform():
+    I = InterpolationMode
+
+    # 얼굴 정렬/크롭
+    align = AlignAndCropFace(out_size=(320, 320), enlarge=1.3, fill=(128, 128, 128))
+
+    # 과도한 회전/퍼스펙티브 제거하고 현실적 변동에 초점을 두기
+    aug = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        # 밝기/대비 약하게
+        transforms.ColorJitter(brightness=0.10, contrast=0.10),
+        # 약한 shift/scale (rotate_limit=0으로 회전 제거)
+        transforms.RandomAffine(
+            degrees=0,
+            translate=(0.05, 0.05),
+            scale=(0.95, 1.05),
+            interpolation=I.BICUBIC
+        ),
+    ])
+
+    return transforms.Compose([
+        align,
+        transforms.Lambda(lambda im: letterbox_320(im, fill=0, interp=I.BICUBIC)),
+        aug,
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+
+def _build_test_transform():
+    I = InterpolationMode
+    align = AlignAndCropFace(out_size=(320, 320), enlarge=1.3, fill=(128, 128, 128))
+    return transforms.Compose([
+        align,
+        transforms.Lambda(lambda im: letterbox_320(im, fill=0, interp=I.BICUBIC)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+
+def get_data_loaders(
+    train_dir: str,
+    test_dir: str,
+    image_size=(320, 320),  # 유지: 320 고정
+    batch_size=32,
+    num_workers=0,
+    pin_memory=True
+):
+    """
+    - 입력 320 고정
+    - 레터박스(비율 유지 + 패딩)로 업스케일 손상 최소화
+    - 약한 증강(회전 없음): flip / brightness-contrast / shift-scale
+    - AlignAndCropFace 유지
+    """
+    # 실제로는 letterbox가 320 보장을 해주지만, 안전하게 h,w를 확인
+    w, h = image_size
+
+    train_transform = _build_train_transform()
+    test_transform  = _build_test_transform()
+
+    train_dataset = datasets.ImageFolder(train_dir, transform=train_transform)
+    test_dataset  = datasets.ImageFolder(test_dir,  transform=test_transform)
+
+    # Robust Collate: 깨진 샘플/사이즈 오차 방어 >>대부분 pass<<
+    def robust_collate(batch):
+        batch = [(x, y) for (x, y) in batch if x is not None]
+        if len(batch) == 0:
+            return torch.empty(0), torch.empty(0, dtype=torch.long)
+
+        imgs, ys = [], []
+        for img, y in batch:
+            # Tensor 변환 보장(ToTensor 이후면 Tensor)
+            if not torch.is_tensor(img):
+                if isinstance(img, Image.Image):
+                    img = transforms.ToTensor()(img)
+                else:
+                    continue
+            if img.dim() != 3:
+                continue
+
+            C, H, W = img.shape
+            if H != h or W != w:
+                # 안전하게 그냥 맞췄음
+                img = img.unsqueeze(0)
+                img = F.interpolate(img, size=(h, w), mode="bilinear", align_corners=False)
+                img = img.squeeze(0)
+            imgs.append(img)
+            ys.append(y)
+
+        if len(imgs) == 0:
+            return torch.empty(0), torch.empty(0, dtype=torch.long)
+
+        return torch.stack(imgs, 0), torch.tensor(ys, dtype=torch.long)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,  # 학습은 셔플
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+        collate_fn=robust_collate
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,  # 평가는 고정
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+        collate_fn=robust_collate
+    )
+
+    return train_loader, test_loader
